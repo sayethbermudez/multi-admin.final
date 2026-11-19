@@ -1,0 +1,186 @@
+# Multi-Administrador - Orquestación completa (PostgreSQL + Redis + Ollama + Backend + Frontend)
+#
+#   docker compose up --build -d      ->  http://localhost:3000
+#   docker compose logs -f backend    ->  ver el arranque de la API
+#   docker compose logs -f ollama-init -> ver la descarga automática del modelo de Ollama
+#   docker compose down -v            ->  borrar TODO (incluida la BD y modelos) y empezar limpio
+#
+# El frontend NO habla directamente con el puerto 8000: usa /api y nginx
+# (dentro del contenedor frontend) reenvía a backend:8000. Así funciona desde
+# localhost, desde otra IP de la LAN o desde un túnel, sin problemas de CORS.
+
+services:
+  # ------------------------------------------------------------------ DB
+  db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-multiadmin}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-multiadmin}
+      POSTGRES_DB: ${POSTGRES_DB:-multiadmin_db}
+    volumes:
+      - db_data:/var/lib/postgresql/data
+      # Script de creación del esquema. SOLO se ejecuta la primera vez que se
+      # crea el volumen (si ya existía, usa `docker compose down -v`).
+      - ./db/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    ports:
+      # 5433 en el host para no chocar con un PostgreSQL instalado localmente.
+      - "${POSTGRES_PORT:-5433}:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-multiadmin} -d ${POSTGRES_DB:-multiadmin_db}"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 10s
+
+  # -------------------------------------------------------------- Redis
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redis_data:/data
+    ports:
+      # 6380 en el host para no chocar con un Redis instalado localmente.
+      - "${REDIS_PORT:-6380}:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 5s
+
+  # ------------------------------------------------------------- Ollama
+  # Servidor local de modelos IA para el chatbot (última versión estable de Ollama).
+  # Los modelos descargados se conservan en el volumen persistente `ollama_data`.
+  ollama:
+    image: ollama/ollama:latest
+    restart: unless-stopped
+    ports:
+      - "${OLLAMA_PORT:-11434}:11434"
+    volumes:
+      - ollama_data:/root/.ollama
+    environment:
+      OLLAMA_KEEP_ALIVE: ${OLLAMA_KEEP_ALIVE:-10m}
+    healthcheck:
+      test: ["CMD-SHELL", "ollama list >/dev/null 2>&1"]
+      interval: 10s
+      timeout: 5s
+      retries: 15
+      start_period: 10s
+
+  # Descarga automáticamente el modelo configurado (por defecto llama3.2:3b) la
+  # primera vez que se levanta Docker Compose. En arranques posteriores termina
+  # al instante porque el modelo queda cacheado en `ollama_data`.
+  ollama-init:
+    image: ollama/ollama:latest
+    restart: "no"
+    depends_on:
+      ollama:
+        condition: service_healthy
+    environment:
+      OLLAMA_HOST: http://ollama:11434
+      OLLAMA_MODEL: ${OLLAMA_MODEL:-llama3.2:3b}
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        echo "[ollama-init] Verificando modelo: $$OLLAMA_MODEL"
+        ollama pull "$$OLLAMA_MODEL"
+        echo "[ollama-init] Modelo $$OLLAMA_MODEL listo para el chatbot."
+
+  # ------------------------------------------------- Mailpit (opcional)
+  # Buzón de correo local para DESARROLLO: captura todos los correos que envía
+  # la aplicación y los muestra en una interfaz web, sin necesidad de Gmail ni
+  # de credenciales. Se levanta solo si se pide:
+  #
+  #   docker compose --profile correo up -d mailpit
+  #   MAIL_SERVER=mailpit  MAIL_PORT=1025  MAIL_AUTH=false   (en .env)
+  #   Interfaz: http://localhost:8025
+  mailpit:
+    image: axllent/mailpit:latest
+    profiles: ["correo"]
+    restart: unless-stopped
+    ports:
+      - "${MAILPIT_UI_PORT:-8025}:8025"   # interfaz web
+      - "${MAILPIT_SMTP_PORT:-1025}:1025" # SMTP
+    environment:
+      MP_MAX_MESSAGES: 500
+
+  # ------------------------------------------------------------ Backend
+  backend:
+    build:
+      context: ./backend
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      ollama:
+        condition: service_started
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER:-multiadmin}:${POSTGRES_PASSWORD:-multiadmin}@db:5432/${POSTGRES_DB:-multiadmin_db}
+      SECRET_KEY: ${SECRET_KEY:-cambia-esto-por-un-valor-secreto-largo-y-aleatorio}
+      ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:-http://localhost:3000,http://127.0.0.1:3000,http://localhost:5173}
+      FRONTEND_URL: ${FRONTEND_URL:-http://localhost:3000}
+      SQL_ECHO: ${SQL_ECHO:-false}
+      REDIS_URL: redis://redis:6379/0
+      # Modo demo: habilita el selector "Administrador" en Crear cuenta.
+      # true por defecto para que funcione sin configurar nada; en producción
+      # define PERMITIR_REGISTRO_ADMIN=false en el .env.
+      PERMITIR_REGISTRO_ADMIN: ${PERMITIR_REGISTRO_ADMIN:-true}
+      # ---- SMTP (opcional: verificación de cuenta y recuperación) ----
+      EMAIL_USER: ${EMAIL_USER:-}
+      EMAIL_PASSWORD: ${EMAIL_PASSWORD:-}
+      MAIL_FROM: ${MAIL_FROM:-}
+      MAIL_PORT: ${MAIL_PORT:-587}
+      MAIL_SERVER: ${MAIL_SERVER:-}
+      # Cifrado y autenticación del SMTP (ver README -> correo):
+      #   587 -> STARTTLS (por defecto)  ·  465 -> SSL/TLS automático
+      #   MAIL_AUTH=false para servidores locales de pruebas (Mailpit/MailHog).
+      MAIL_STARTTLS: ${MAIL_STARTTLS:-}
+      MAIL_SSL_TLS: ${MAIL_SSL_TLS:-}
+      MAIL_AUTH: ${MAIL_AUTH:-true}
+      MAIL_SSL_CERTS: ${MAIL_SSL_CERTS:-true}
+      MAIL_TIMEOUT: ${MAIL_TIMEOUT:-30}
+      # ---- Notificaciones reales (correo + Web Push / VAPID) ----
+      NOTIFICACIONES_CORREO: ${NOTIFICACIONES_CORREO:-true}
+      VAPID_PUBLIC_KEY: ${VAPID_PUBLIC_KEY:-}
+      VAPID_PRIVATE_KEY: ${VAPID_PRIVATE_KEY:-}
+      VAPID_SUBJECT: ${VAPID_SUBJECT:-mailto:no-reply@multiadmin.com}
+      # ---- Chatbot (Ollama) ----
+      CHATBOT_ENGINE: ${CHATBOT_ENGINE:-ollama}
+      OLLAMA_BASE_URL: ${OLLAMA_BASE_URL:-http://ollama:11434}
+      OLLAMA_MODEL: ${OLLAMA_MODEL:-llama3.2:3b}
+      OLLAMA_TIMEOUT: ${OLLAMA_TIMEOUT:-120}
+      OLLAMA_KEEP_ALIVE: ${OLLAMA_KEEP_ALIVE:-10m}
+    ports:
+      - "${BACKEND_PORT:-8000}:8000"
+    volumes:
+      - documentos_data:/app/archivos_documentos
+    healthcheck:
+      test: ["CMD-SHELL", "python -c 'import urllib.request; urllib.request.urlopen(\"http://127.0.0.1:8000/health\", timeout=3)'"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
+
+  # ----------------------------------------------------------- Frontend
+  frontend:
+    build:
+      context: ./frontend
+      args:
+        # Vacío = el bundle usa /api (proxy de nginx). Ver GUIA_DOCKER.md.
+        VITE_API_URL: ${VITE_API_URL:-}
+    restart: unless-stopped
+    depends_on:
+      backend:
+        condition: service_healthy
+    ports:
+      - "${FRONTEND_PORT:-3000}:80"
+
+volumes:
+  db_data:
+  redis_data:
+  documentos_data:
+  ollama_data:
